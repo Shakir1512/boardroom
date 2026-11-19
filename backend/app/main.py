@@ -94,6 +94,12 @@ class BudgetRequest(BaseModel):
     alert_threshold: float = 0.8
 
 
+class ScenarioRequest(BaseModel):
+    dataset_id: str
+    metric_key: str
+    change_percent: float
+
+
 async def audit(db: AsyncSession, user: User, action: str, resource_type: str,
                 resource_id: str | None = None, details: dict | None = None):
     db.add(AuditLog(user_id=user.id, action=action, resource_type=resource_type,
@@ -105,6 +111,7 @@ async def audit(db: AsyncSession, user: User, action: str, resource_type: str,
 async def startup():
     await init_db()
     await seed_platform()
+    await rehydrate_datasets()
 
 
 @app.on_event("shutdown")
@@ -324,6 +331,312 @@ async def get_authorized_dataset(
         if "dataset:transform" not in permissions:
             raise HTTPException(status_code=403, detail="Permission denied: dataset:transform")
     return dataset
+
+
+async def rehydrate_datasets():
+    """Restore analytical tables from authorized uploaded files after an API restart."""
+    async for db in get_db():
+        datasets = (await db.execute(select(Dataset).where(Dataset.status == "ready"))).scalars().all()
+        for dataset in datasets:
+            source = Path(dataset.file_path)
+            if not source.exists():
+                continue
+            try:
+                table = safe_table_name(dataset.id)
+                if dataset.file_type == "csv":
+                    profile_csv(source, table)
+                elif dataset.file_type in {"sqlite", "sqlite3", "db"}:
+                    profile_sqlite(source, table)
+            except Exception as exc:
+                # The dataset remains visible; analytical endpoints will surface a clear unavailable state.
+                print(f"Dataset rehydration failed for {dataset.id}: {exc}")
+                continue
+
+
+def executive_metric_columns(columns: list[SemanticModel]) -> dict[str, str]:
+    """Map only semantically plausible business measures; calculations remain deterministic."""
+    measures = {c.column_name.lower(): c.column_name for c in columns if c.semantic_type == "measure"}
+    def match(*tokens: str) -> str | None:
+        for low, actual in measures.items():
+            if any(token in low for token in tokens):
+                return actual
+        return None
+    return {
+        "revenue": match("revenue", "sales", "net_sales", "amount", "mrr"),
+        "profit": match("profit", "margin_amount", "net_income"),
+        "cost": match("cost", "expense", "spend"),
+        "returns": match("return", "refund"),
+    }
+
+
+def detect_business_domain(columns: list[SemanticModel]) -> str:
+    names = " ".join(c.column_name.lower() for c in columns)
+    if any(word in names for word in ("subscription", "mrr", "arr", "plan", "churn")):
+        return "SaaS subscriptions"
+    if any(word in names for word in ("order", "product", "return", "shipping", "discount")):
+        return "E-commerce"
+    if any(word in names for word in ("expense", "profit", "budget", "variance")):
+        return "Financial performance"
+    if any(word in names for word in ("processing", "throughput", "duration", "efficiency")):
+        return "Operational performance"
+    return "General business analytics"
+
+
+def _number(value: Any) -> float | None:
+    try:
+        value = float(value)
+        return value if value == value and value not in (float("inf"), float("-inf")) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def build_executive_analysis(frame, columns: list[SemanticModel], dataset: Dataset, quality: QualityReport | None) -> dict[str, Any]:
+    """Build a traceable report from the loaded table without an LLM or arbitrary scoring."""
+    import pandas as pd
+    metrics = executive_metric_columns(columns)
+    domain = detect_business_domain(columns)
+    date_column = next((c.column_name for c in columns if c.semantic_type == "datetime"), None)
+    categories = [c.column_name for c in columns if c.semantic_type == "category" and c.unique_count and c.unique_count <= 40]
+    numeric = [c.column_name for c in columns if c.semantic_type == "measure" and c.column_name in frame.columns]
+    kpis: list[dict[str, Any]] = []
+    evidence: list[dict[str, Any]] = []
+    trends: list[dict[str, Any]] = []
+    revenue_col = metrics.get("revenue")
+    if revenue_col and revenue_col in frame:
+        values = pd.to_numeric(frame[revenue_col], errors="coerce")
+        total = float(values.sum(skipna=True))
+        kpis.append({"key": "revenue", "label": "Total Revenue", "value": total, "unit": "currency", "calculation": f"SUM({revenue_col})", "interpretation": "Verified sum of available revenue records."})
+        evidence.append({"title": "Revenue base", "type": "VERIFIED FACT", "finding": f"Total {revenue_col} is {total:,.2f}.", "metric": total, "calculation": f"SELECT SUM({quote_identifier(revenue_col)}) FROM {quote_identifier(safe_table_name(dataset.id))}", "severity": "informational"})
+    if metrics.get("profit") in frame:
+        col = metrics["profit"]; value = float(pd.to_numeric(frame[col], errors="coerce").sum(skipna=True))
+        kpis.append({"key": "profit", "label": "Total Profit", "value": value, "unit": "currency", "calculation": f"SUM({col})", "interpretation": "Verified sum of available profit records."})
+        if revenue_col:
+            revenue = next((x["value"] for x in kpis if x["key"] == "revenue"), 0)
+            if revenue:
+                kpis.append({"key": "margin", "label": "Profit Margin", "value": value / revenue * 100, "unit": "percent", "calculation": f"SUM({col}) / SUM({revenue_col})", "interpretation": "Profit divided by revenue; not a target comparison."})
+    order_col = next((c.column_name for c in columns if "order" in c.column_name.lower() and c.semantic_type in {"identifier", "category"}), None)
+    customer_col = next((c.column_name for c in columns if any(x in c.column_name.lower() for x in ("customer", "client", "account")) and c.semantic_type in {"identifier", "category"}), None)
+    for key, label, column in (("orders", "Orders", order_col), ("customers", "Customers", customer_col)):
+        if column and column in frame:
+            value = int(frame[column].nunique(dropna=True))
+            kpis.append({"key": key, "label": label, "value": value, "unit": "count", "calculation": f"COUNT(DISTINCT {column})", "interpretation": "Verified distinct non-null identifiers."})
+    if revenue_col and order_col:
+        orders = next((x["value"] for x in kpis if x["key"] == "orders"), 0)
+        if orders:
+            kpis.append({"key": "aov", "label": "Average Order Value", "value": next(x["value"] for x in kpis if x["key"] == "revenue") / orders, "unit": "currency", "calculation": f"SUM({revenue_col}) / COUNT(DISTINCT {order_col})", "interpretation": "Revenue per distinct order."})
+    if metrics.get("returns") in frame and order_col:
+        returned = pd.to_numeric(frame[metrics["returns"]], errors="coerce").fillna(0).gt(0).sum()
+        orders = next((x["value"] for x in kpis if x["key"] == "orders"), 0)
+        if orders:
+            kpis.append({"key": "return_rate", "label": "Return Rate", "value": returned / orders * 100, "unit": "percent", "calculation": f"COUNT({metrics['returns']} > 0) / COUNT(DISTINCT {order_col})", "interpretation": "Share of distinct orders with a positive return value."})
+    if date_column and revenue_col:
+        parsed = pd.to_datetime(frame[date_column], errors="coerce", utc=True)
+        valid = frame.loc[parsed.notna()].copy(); valid["__period"] = parsed[parsed.notna()].dt.to_period("M").astype(str)
+        valid["__metric"] = pd.to_numeric(valid[revenue_col], errors="coerce")
+        monthly = valid.groupby("__period", as_index=False)["__metric"].sum().sort_values("__period")
+        trends = [
+            {"period": str(period), "value": float(value)}
+            for period, value in zip(monthly["__period"], monthly["__metric"])
+        ]
+        if len(monthly) >= 2:
+            current, previous = float(monthly.iloc[-1]["__metric"]), float(monthly.iloc[-2]["__metric"])
+            change = current - previous; pct = change / abs(previous) * 100 if previous else None
+            kpis[0].update({"previous_value": previous, "change": change, "change_percent": pct})
+            severity = "high" if pct is not None and pct < -10 else "informational"
+            evidence.append({"title": "Latest period change", "type": "VERIFIED FACT", "finding": f"{monthly.iloc[-1]['__period']} revenue changed {pct:+.1f}% versus {monthly.iloc[-2]['__period']} ({change:+,.2f})." if pct is not None else "Previous period was zero; percentage change is unavailable.", "metric": change, "calculation": f"Monthly SUM({revenue_col}); latest minus prior month", "severity": severity})
+            if categories:
+                segment = categories[0]
+                valid["__segment"] = valid[segment].fillna("Unknown").astype(str)
+                pivot = valid.groupby(["__period", "__segment"])["__metric"].sum().unstack(fill_value=0)
+                if len(pivot.index) >= 2:
+                    drivers = (pivot.iloc[-1] - pivot.iloc[-2]).sort_values(key=lambda s: s.abs(), ascending=False).head(5)
+                    total = float(drivers.sum())
+                    evidence.append({"title": f"What changed by {segment}", "type": "VERIFIED FACT", "finding": f"Top measured contributors reconcile to {total:+,.2f} of the {change:+,.2f} period change; any difference is explicitly residual.", "metric": total, "drivers": [{"segment": str(k), "contribution": float(v)} for k, v in drivers.items()], "residual": change-total, "calculation": f"SUM({revenue_col}) by month and {segment}; current minus previous", "severity": severity})
+    anomalies=[]
+    for col in numeric[:6]:
+        series=pd.to_numeric(frame[col], errors="coerce").dropna()
+        if len(series) >= 8:
+            q1,q3=series.quantile(.25),series.quantile(.75); iqr=q3-q1
+            if iqr > 0:
+                out=series[(series < q1-1.5*iqr) | (series > q3+1.5*iqr)]
+                if len(out): anomalies.append({"column":col,"count":int(len(out)),"baseline":{"q1":float(q1),"q3":float(q3)},"method":"IQR (1.5×)","severity":"high" if len(out)/len(series)>.05 else "medium","examples":[float(v) for v in out.head(3)]})
+    quality_score = quality.overall_score if quality else None
+    dimensions=[]
+    if revenue_col and trends and len(trends)>=2:
+        latest_change = kpis[0].get("change_percent")
+        if latest_change is not None: dimensions.append({"name":"Revenue performance","score":max(0,min(100,50+latest_change*2)),"basis":"Latest monthly revenue change relative to 50 baseline"})
+    if any(x["key"]=="margin" for x in kpis): dimensions.append({"name":"Profitability","score":max(0,min(100,next(x["value"] for x in kpis if x["key"]=="margin"))),"basis":"Profit margin percentage"})
+    if quality_score is not None: dimensions.append({"name":"Data reliability","score":quality_score,"basis":"Latest data-quality scan"})
+    health_score = round(sum(x["score"] for x in dimensions)/len(dimensions),1) if dimensions else None
+    alerts=[]
+    for item in evidence:
+        if item["severity"] == "high": alerts.append({"severity":"High","title":item["title"],"detail":item["finding"]})
+    for anomaly in anomalies[:3]: alerts.append({"severity":anomaly["severity"].title(),"title":f"Unusual {anomaly['column']} values","detail":f"{anomaly['count']} IQR outlier(s); investigate before treating as a business issue."})
+    if quality_score is not None and quality_score < 85: alerts.append({"severity":"Medium","title":"Data reliability needs review","detail":f"Latest data quality score is {quality_score:.1f}% and may affect interpretation."})
+    brief = f"{domain} analysis covers {len(frame):,} records. " + (f"The verified revenue base is {next(x['value'] for x in kpis if x['key']=='revenue'):,.2f}. " if any(x['key']=='revenue' for x in kpis) else "No supported revenue measure was detected. ") + (evidence[1]["finding"] if len(evidence)>1 else "Review the KPI calculations and data-quality status before acting.")
+    return {"dataset":{"name":dataset.name,"records":len(frame),"domain":domain,"generated_at":datetime.now(timezone.utc).isoformat(),"date_column":date_column},"kpis":kpis,"trend":trends,"evidence":evidence,"anomalies":anomalies,"alerts":alerts,"health":{"score":health_score,"dimensions":dimensions,"methodology":"Arithmetic average of applicable, disclosed dimensions; data reliability is reported separately from business performance."},"quality":{"score":quality_score,"status":"scanned" if quality else "not scanned"},"briefing":brief,"methodology":"Verified facts are calculated directly from the uploaded dataset. Statistical findings use stated methods. Interpretations are not causal claims."}
+
+
+def build_deep_dive(frame, columns: list[SemanticModel], dataset: Dataset) -> dict[str, Any]:
+    """Generic, reproducible descriptive analytics for the analytical workspace."""
+    import pandas as pd
+    numeric = [c.column_name for c in columns if c.semantic_type == "measure" and c.column_name in frame.columns]
+    categories = [c.column_name for c in columns if c.semantic_type == "category" and c.column_name in frame.columns and 1 < (c.unique_count or 0) <= 30]
+    metrics = executive_metric_columns(columns)
+    primary = metrics.get("revenue") or (numeric[0] if numeric else None)
+    statistics=[]
+    for column in numeric[:10]:
+        series=pd.to_numeric(frame[column],errors="coerce").dropna()
+        if len(series):
+            statistics.append({"column":column,"count":int(len(series)),"missing":int(len(frame)-len(series)),"mean":float(series.mean()),"median":float(series.median()),"std_dev":float(series.std()) if len(series)>1 else 0,"p25":float(series.quantile(.25)),"p75":float(series.quantile(.75)),"min":float(series.min()),"max":float(series.max())})
+    segments=[]
+    if primary:
+        metric_series=pd.to_numeric(frame[primary],errors="coerce")
+        for category in categories[:4]:
+            grouped=frame.assign(__metric=metric_series).groupby(category,dropna=False)["__metric"].agg(["sum","mean","count"]).reset_index().sort_values("sum",ascending=False).head(12)
+            segments.append({"dimension":category,"metric":primary,"rows":[{"segment":"Unknown" if pd.isna(row[category]) else str(row[category]),"value":float(row["sum"] or 0),"average":float(row["mean"] or 0),"records":int(row["count"])} for _,row in grouped.iterrows()]})
+    correlations=[]
+    if len(numeric)>=2:
+        matrix=frame[numeric[:8]].apply(pd.to_numeric,errors="coerce").corr()
+        for left_index,left in enumerate(matrix.columns):
+            for right in matrix.columns[left_index+1:]:
+                coefficient=matrix.loc[left,right]
+                if pd.notna(coefficient) and abs(coefficient)>=.35: correlations.append({"left":left,"right":right,"coefficient":float(coefficient),"strength":"strong" if abs(coefficient)>=.7 else "moderate","note":"Correlation describes association only; it does not establish causation."})
+        correlations.sort(key=lambda item:abs(item["coefficient"]),reverse=True)
+    date_column=next((c.column_name for c in columns if c.semantic_type=="datetime"),None)
+    forecast={"available":False,"reason":"A dated numeric measure with at least 12 valid monthly observations is required."}
+    if date_column and primary:
+        dates=pd.to_datetime(frame[date_column],errors="coerce",utc=True)
+        observations=int(dates.notna().sum())
+        months=int(dates[dates.notna()].dt.to_period("M").nunique()) if observations else 0
+        if months>=12: forecast={"available":False,"reason":"Historical coverage is sufficient, but forecasting is intentionally not run until a validated model and holdout evaluation are selected.","observations":months,"measure":primary}
+        else: forecast={"available":False,"reason":f"Only {months} valid monthly observations are available; at least 12 are required for forecast validation.","observations":months,"measure":primary}
+    return {"statistics":statistics,"segments":segments,"correlations":correlations[:12],"forecast":forecast,"methodology":"Descriptive statistics use non-null numeric values. Segment values are aggregated sums. Correlations are Pearson coefficients over paired numeric values."}
+
+
+@app.get("/api/v1/executive/datasets/{dataset_id}")
+async def executive_dataset_analysis(dataset_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    dataset = await get_authorized_dataset(dataset_id, user, db)
+    table = safe_table_name(dataset.id)
+    if not get_duckdb().table_exists(table): raise HTTPException(status_code=409, detail="Dataset is not loaded in the analytics engine")
+    columns = (await db.execute(select(SemanticModel).where(SemanticModel.dataset_id == dataset.id))).scalars().all()
+    from sqlalchemy import desc
+    quality = (await db.execute(select(QualityReport).where(QualityReport.dataset_id == dataset.id).order_by(desc(QualityReport.created_at)).limit(1))).scalar_one_or_none()
+    frame = get_duckdb().query_df(f"SELECT * FROM {quote_identifier(table)}")
+    return build_executive_analysis(frame, columns, dataset, quality)
+
+
+@app.get("/api/v1/executive/datasets/{dataset_id}/deep-dive")
+async def executive_deep_dive(dataset_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    dataset = await get_authorized_dataset(dataset_id, user, db)
+    table=safe_table_name(dataset.id)
+    if not get_duckdb().table_exists(table): raise HTTPException(status_code=409, detail="Dataset is not loaded in the analytics engine")
+    columns=(await db.execute(select(SemanticModel).where(SemanticModel.dataset_id==dataset.id))).scalars().all()
+    return build_deep_dive(get_duckdb().query_df(f"SELECT * FROM {quote_identifier(table)}"),columns,dataset)
+
+
+@app.post("/api/v1/executive/scenario")
+async def executive_scenario(payload: ScenarioRequest, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    dataset = await get_authorized_dataset(payload.dataset_id, user, db)
+    analysis = await executive_dataset_analysis(dataset.id, user, db)
+    metric = next((item for item in analysis["kpis"] if item["key"] == payload.metric_key), None)
+    if not metric: raise HTTPException(status_code=422, detail="That KPI is not available for this dataset")
+    baseline=float(metric["value"]); simulated=baseline*(1+payload.change_percent/100)
+    return {"metric":metric["label"],"baseline":baseline,"change_percent":payload.change_percent,"simulated":simulated,"difference":simulated-baseline,"assumptions":"Linear mathematical sensitivity applied to the selected KPI; this is not a forecast and does not validate operational dependencies."}
+
+
+def build_premium_executive_pdf(analysis: dict[str, Any]) -> io.BytesIO:
+    """Render the executive report as a visual document, using the same verified data as the UI."""
+    from reportlab.graphics.charts.barcharts import VerticalBarChart
+    from reportlab.graphics.charts.lineplots import LinePlot
+    from reportlab.graphics.shapes import Drawing, String
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_CENTER
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import inch
+    from reportlab.platypus import KeepTogether, PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+    from xml.sax.saxutils import escape
+    dataset=analysis["dataset"]; buffer=io.BytesIO(); styles=getSampleStyleSheet()
+    styles.add(ParagraphStyle(name="CoverTitle",parent=styles["Title"],fontSize=29,leading=35,alignment=TA_CENTER,textColor=colors.HexColor("#111D35")))
+    styles.add(ParagraphStyle(name="Kicker",parent=styles["Heading2"],fontSize=10,leading=14,alignment=TA_CENTER,textColor=colors.HexColor("#5D7CFB"),spaceAfter=8))
+    styles.add(ParagraphStyle(name="Narrative",parent=styles["BodyText"],leading=15,textColor=colors.HexColor("#334155")))
+    def footer(canvas, doc):
+        canvas.saveState(); canvas.setStrokeColor(colors.HexColor("#DCE2ED")); canvas.line(doc.leftMargin,.48*inch,letter[0]-doc.rightMargin,.48*inch); canvas.setFillColor(colors.HexColor("#64748B")); canvas.setFont("Helvetica",8); canvas.drawString(doc.leftMargin,.32*inch,"BOARDROOM | Executive Decision Intelligence"); canvas.drawRightString(letter[0]-doc.rightMargin,.32*inch,f"Page {doc.page}"); canvas.restoreState()
+    story=[Spacer(1,1.1*inch),Paragraph("BOARDROOM",styles["Kicker"]),Paragraph("Executive Decision<br/>Report",styles["CoverTitle"]),Spacer(1,.3*inch),Paragraph(escape(dataset["name"]),ParagraphStyle("ds",parent=styles["Heading2"],alignment=TA_CENTER,textColor=colors.HexColor("#334155"))),Paragraph(escape(f"{dataset['domain']} | {dataset['records']:,} records analyzed"),ParagraphStyle("meta",parent=styles["BodyText"],alignment=TA_CENTER,textColor=colors.HexColor("#64748B"))),Spacer(1,3.5*inch),Paragraph("From Raw Data to Executive Decisions",styles["Kicker"]),Paragraph("Verified calculations. Transparent evidence. Leadership-ready actions.",ParagraphStyle("tag",parent=styles["BodyText"],alignment=TA_CENTER,textColor=colors.HexColor("#64748B"))),PageBreak()]
+    story.extend([Paragraph("Executive briefing",styles["Heading1"]),Paragraph(escape(analysis["briefing"]),styles["Narrative"]),Spacer(1,.18*inch),Paragraph("Verified KPI scorecard",styles["Heading2"])])
+    kpi_rows=[]
+    for index in range(0,len(analysis["kpis"]),2):
+        cells=[]
+        for item in analysis["kpis"][index:index+2]:
+            suffix="%" if item["unit"]=="percent" else ""; trend=f"<br/><font color='#067647'>{item['change_percent']:+.1f}% vs previous period</font>" if item.get("change_percent") is not None else ""
+            cells.append(Paragraph(f"<b>{escape(item['label'])}</b><br/><font size=17 color='#111D35'><b>{item['value']:,.2f}{suffix}</b></font>{trend}<br/><font size=7 color='#64748B'>{escape(item['calculation'])}</font>",styles["Narrative"]))
+        kpi_rows.append(cells+[""]*(2-len(cells)))
+    cards=Table(kpi_rows,colWidths=[3.35*inch,3.35*inch]); cards.setStyle(TableStyle([("BOX",(0,0),(-1,-1),.5,colors.HexColor("#DCE2ED")),("INNERGRID",(0,0),(-1,-1),.5,colors.HexColor("#DCE2ED")),("BACKGROUND",(0,0),(-1,-1),colors.HexColor("#F8FAFC")),("VALIGN",(0,0),(-1,-1),"TOP"),("LEFTPADDING",(0,0),(-1,-1),12),("RIGHTPADDING",(0,0),(-1,-1),12),("TOPPADDING",(0,0),(-1,-1),10),("BOTTOMPADDING",(0,0),(-1,-1),10)])); story.extend([cards,PageBreak(),Paragraph("Performance trends",styles["Heading1"])])
+    trend=analysis["trend"][-24:]
+    if trend:
+        values=[float(item["value"]) for item in trend]; drawing=Drawing(500,260); drawing.add(String(0,242,"Verified monthly revenue trend",fontName="Helvetica-Bold",fontSize=10,fillColor=colors.HexColor("#111D35"))); plot=LinePlot(); plot.x,plot.y,plot.width,plot.height=46,38,430,185; plot.data=[list(enumerate(values))]; plot.xValueAxis.valueMin=0; plot.xValueAxis.valueMax=max(1,len(values)-1); plot.xValueAxis.valueStep=max(1,len(values)//6); plot.yValueAxis.valueMin=min(0,min(values)); plot.yValueAxis.valueMax=max(values)*1.1 or 1; plot.yValueAxis.valueStep=max(1,(plot.yValueAxis.valueMax-plot.yValueAxis.valueMin)/5); plot.lines[0].strokeColor=colors.HexColor("#315EFB"); plot.lines[0].strokeWidth=2.5; drawing.add(plot)
+        for index,item in enumerate(trend):
+            if index in {0,len(trend)-1} or index%max(1,len(trend)//5)==0: drawing.add(String(46+430*index/max(1,len(trend)-1),17,item["period"],fontSize=6,textAnchor="middle",fillColor=colors.HexColor("#64748B")))
+        story.extend([Paragraph("Monthly aggregation of the verified primary revenue measure.",styles["Narrative"]),Spacer(1,.1*inch),drawing])
+    story.extend([Spacer(1,.14*inch),Paragraph("What changed and why",styles["Heading1"])])
+    driver=next((item for item in analysis["evidence"] if item.get("drivers")),None)
+    if driver:
+        values=[float(item["contribution"]) for item in driver["drivers"]]; drawing=Drawing(500,245); drawing.add(String(0,228,"Measured segment contributions to the period change",fontName="Helvetica-Bold",fontSize=10,fillColor=colors.HexColor("#111D35"))); chart=VerticalBarChart(); chart.x,chart.y,chart.width,chart.height=44,38,435,165; chart.data=[values]; chart.categoryAxis.categoryNames=[str(item["segment"])[:14] for item in driver["drivers"]]; chart.categoryAxis.labels.angle=25; chart.categoryAxis.labels.dy=-8; chart.valueAxis.valueMin=min(0,min(values)); chart.valueAxis.valueMax=max(values)*1.15 or 1; chart.valueAxis.valueStep=max(1,(chart.valueAxis.valueMax-chart.valueAxis.valueMin)/5); chart.bars[0].fillColor=colors.HexColor("#5D7CFB"); drawing.add(chart); story.extend([Paragraph(escape(driver["finding"]),styles["Narrative"]),Spacer(1,.08*inch),drawing,Paragraph(escape(f"Evidence calculation: {driver['calculation']}"),styles["Code"])])
+    story.append(PageBreak()); story.append(Paragraph("Insights, risks and evidence",styles["Heading1"]))
+    for item in analysis["evidence"]:
+        story.append(KeepTogether([Paragraph(escape(f"{item['title']} | {item['type']}"),styles["Heading3"]),Paragraph(escape(item["finding"]),styles["Narrative"]),Paragraph(escape(f"Evidence: {item['calculation']}"),styles["Code"]),Spacer(1,.09*inch)]))
+    story.append(Paragraph("Anomaly and risk radar",styles["Heading2"]))
+    rows=[["Severity","Measure","Method","Signals"]]+[[item["severity"].title(),item["column"],item["method"],str(item["count"])] for item in analysis["anomalies"]]
+    if len(rows)==1: rows.append(["Informational","No material anomaly","IQR (1.5x)","0"])
+    risks=Table(rows,colWidths=[1*inch,1.7*inch,2.6*inch,1.1*inch],repeatRows=1); risks.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),colors.HexColor("#111D35")),("TEXTCOLOR",(0,0),(-1,0),colors.white),("GRID",(0,0),(-1,-1),.25,colors.HexColor("#DCE2ED")),("FONTSIZE",(0,0),(-1,-1),8),("ROWBACKGROUNDS",(0,1),(-1,-1),[colors.white,colors.HexColor("#F8FAFC")])]))
+    story.extend([risks,Spacer(1,.2*inch),Paragraph("Methodology and limitations",styles["Heading1"]),Paragraph(escape(analysis["methodology"]),styles["Narrative"]),Paragraph("Scenario analyses are mathematical sensitivities, not forecasts.",styles["Narrative"])])
+    document=SimpleDocTemplate(buffer,pagesize=letter,title="Executive Decision Report",rightMargin=.65*inch,leftMargin=.65*inch,topMargin=.68*inch,bottomMargin=.65*inch); document.build(story,onFirstPage=footer,onLaterPages=footer); buffer.seek(0); return buffer
+
+
+@app.get("/api/v1/executive/datasets/{dataset_id}/export")
+async def export_executive_analysis(dataset_id: str, format: str = Query("markdown", pattern="^(markdown|pdf)$"), user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    """Export the same calculated executive evidence shown in the Decision Center."""
+    analysis = await executive_dataset_analysis(dataset_id, user, db)
+    dataset = analysis["dataset"]
+    lines = [f"# Executive Decision Report: {dataset['name']}", "", f"**Domain:** {dataset['domain']}  ", f"**Records analyzed:** {dataset['records']:,}  ", f"**Generated:** {dataset['generated_at']}", "", "## Executive briefing", "", analysis["briefing"], "", "## Verified KPIs", "", "| KPI | Value | Calculation |", "| --- | ---: | --- |"]
+    for item in analysis["kpis"]:
+        suffix = "%" if item["unit"] == "percent" else ""
+        lines.append(f"| {item['label']} | {item['value']:,.2f}{suffix} | `{item['calculation']}` |")
+    lines.extend(["", "## What changed & why", ""])
+    for item in analysis["evidence"]:
+        lines.extend([f"### {item['title']} — {item['type']}", item["finding"], "", f"**Evidence calculation:** `{item['calculation']}`", ""])
+    lines.extend(["## Anomaly & risk radar", ""])
+    for item in analysis["anomalies"]:
+        lines.append(f"- **{item['column']}** ({item['severity']}): {item['count']} IQR outlier(s), baseline Q1 {item['baseline']['q1']:.3g}, Q3 {item['baseline']['q3']:.3g}.")
+    lines.extend(["", "## Methodology & limitations", "", analysis["methodology"], "", "Scenario results, when used, are mathematical sensitivities rather than forecasts."])
+    markdown = "\n".join(lines)
+    safe_name = "".join(ch for ch in dataset["name"] if ch.isascii() and (ch.isalnum() or ch in " ._-")) or "executive_report"
+    if format == "markdown":
+        return StreamingResponse(io.BytesIO(markdown.encode("utf-8")), media_type="text/markdown", headers={"Content-Disposition": f'attachment; filename="{safe_name}.md"'})
+    return StreamingResponse(
+        build_premium_executive_pdf(analysis),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{safe_name}.pdf"'},
+    )
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.lib.units import inch
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle, PageBreak
+    from xml.sax.saxutils import escape
+    buffer = io.BytesIO(); styles = getSampleStyleSheet()
+    story = [Spacer(1, 1.25*inch), Paragraph("BOARDROOM", styles["Title"]), Paragraph("Executive Decision Report", styles["Title"]), Spacer(1,.25*inch), Paragraph(escape(dataset["name"]), styles["Heading1"]), Paragraph(escape(f"{dataset['domain']} · {dataset['records']:,} records analyzed"), styles["BodyText"]), Spacer(1,3*inch), Paragraph("From Raw Data to Executive Decisions", styles["Heading2"]), PageBreak(), Paragraph("Executive briefing", styles["Heading1"]), Paragraph(escape(analysis["briefing"]), styles["BodyText"]), Spacer(1,.2*inch), Paragraph("Verified KPI scorecard", styles["Heading2"])]
+    table_rows = [["KPI", "Value", "Underlying calculation"]] + [[x["label"], f"{x['value']:,.2f}{'%' if x['unit']=='percent' else ''}", x["calculation"]] for x in analysis["kpis"]]
+    table = Table(table_rows, colWidths=[1.45*inch, 1.15*inch, 3.7*inch], repeatRows=1)
+    table.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),colors.HexColor("#111d35")),("TEXTCOLOR",(0,0),(-1,0),colors.white),("GRID",(0,0),(-1,-1),.25,colors.HexColor("#dce2ed")),("FONTSIZE",(0,0),(-1,-1),8),("VALIGN",(0,0),(-1,-1),"TOP"),("ROWBACKGROUNDS",(0,1),(-1,-1),[colors.white,colors.HexColor("#f7f9fc")])]))
+    story.extend([table, Spacer(1,.25*inch), Paragraph("What changed & why", styles["Heading1"])])
+    for item in analysis["evidence"]:
+        story.extend([Paragraph(escape(f"{item['title']} · {item['type']}"), styles["Heading3"]), Paragraph(escape(item["finding"]), styles["BodyText"]), Paragraph(escape(f"Evidence: {item['calculation']}"), styles["Code"]), Spacer(1,.1*inch)])
+    story.extend([Paragraph("Methodology & limitations", styles["Heading1"]), Paragraph(escape(analysis["methodology"]), styles["BodyText"])])
+    document=SimpleDocTemplate(buffer,pagesize=letter,title="Executive Decision Report",rightMargin=.65*inch,leftMargin=.65*inch,topMargin=.65*inch,bottomMargin=.65*inch)
+    document.build(story); buffer.seek(0)
+    return StreamingResponse(buffer, media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="{safe_name}.pdf"'})
 
 
 def infer_semantic_type(name: str, dtype: str, values: list[Any]) -> str:
@@ -619,14 +932,18 @@ async def quality_scan(
     issues = []
     null_total = 0
     invalid_date_total = 0
+    import pandas as pd
+    quality_frame = get_duckdb().query_df(f"SELECT * FROM {quote_identifier(table)}")
+    duplicate_total = int(quality_frame.duplicated().sum())
+    if duplicate_total:
+        issues.append({"type": "duplicate_records", "column": None, "count": duplicate_total,
+                       "severity": "high" if duplicate_total / max(1, len(quality_frame)) > .02 else "medium"})
     for column in columns:
         if column.null_count:
             null_total += column.null_count
             issues.append({"type": "missing_values", "column": column.column_name,
                            "count": column.null_count, "severity": "medium"})
         if column.semantic_type == "datetime":
-            import pandas as pd
-
             raw_values = get_duckdb().query_df(
                 f"SELECT {quote_identifier(column.column_name)} "
                 f"FROM {quote_identifier(table)}"
@@ -645,14 +962,17 @@ async def quality_scan(
     total_cells = max(1, (dataset.row_count or 0) * len(columns))
     completeness = round(max(0.0, 1 - null_total / total_cells) * 100, 2)
     invalid_date_pct = invalid_date_total / max(1, dataset.row_count or 0) * 100
+    duplicate_pct = duplicate_total / max(1, dataset.row_count or 0) * 100
     constant_columns = sum(issue["type"] == "constant_column" for issue in issues)
-    consistency = round(max(0.0, 100 - invalid_date_pct - constant_columns * 5), 2)
+    consistency = round(max(0.0, 100 - invalid_date_pct - duplicate_pct - constant_columns * 5), 2)
     overall = round((completeness + consistency) / 2, 2)
     recommendations = []
     if any(issue["type"] == "missing_values" for issue in issues):
         recommendations.append({"action": "Review missing values in the flagged columns", "priority": "high"})
     if any(issue["type"] == "invalid_dates" for issue in issues):
         recommendations.append({"action": "Normalize or remove unparseable date values", "priority": "high"})
+    if duplicate_total:
+        recommendations.append({"action": "Review duplicate records before using totals or customer counts", "priority": "high"})
     if any(issue["type"] == "constant_column" for issue in issues):
         recommendations.append({"action": "Review constant columns for analytical relevance", "priority": "low"})
     if not recommendations:
@@ -667,7 +987,11 @@ async def quality_scan(
     await db.commit()
     return {"id": report.id, "overall_score": overall, "completeness_score": completeness,
             "consistency_score": consistency, "accuracy_score": consistency,
-            "issues": issues, "recommendations": recommendations}
+            "issues": issues, "recommendations": recommendations,
+            "raw_records": len(quality_frame), "duplicate_records": duplicate_total,
+            "duplicate_percent": round(duplicate_pct, 2),
+            "missing_cells": null_total, "invalid_dates": invalid_date_total,
+            "cleaning_actions": "No records were altered; this report profiles raw uploaded data."}
 
 
 @app.get("/api/v1/quality/datasets/{dataset_id}")
@@ -1043,6 +1367,24 @@ async def analytics_query(
     )
     db.add(user_message)
     await db.flush()
+    greeting_words = {"hi", "hello", "hey", "good morning", "good afternoon", "good evening"}
+    if payload.question.strip().lower().rstrip("!?.") in greeting_words:
+        assistant_message = ChatMessage(
+            conversation_id=conversation.id,
+            role="assistant",
+            content=("Hello — I’m ready to analyze this dataset with verified, read-only calculations. "
+                     "Try ‘Show monthly sales trend’, ‘Compare sales by region’, ‘What is the average order value?’, "
+                     "or ‘Which products have the highest profit?’"),
+            message_metadata={"generation_method": "guided_response", "suggestions": [
+                "Show monthly sales trend", "Compare sales by region", "Which products have the highest profit?"
+            ]},
+            sequence_order=user_message.sequence_order + 1,
+        )
+        db.add(assistant_message)
+        conversation.updated_at = datetime.now(timezone.utc)
+        await db.commit()
+        return {"conversation_id": conversation.id, "assistant_message_id": assistant_message.id,
+                "summary": assistant_message.content, "generation_method": "guided_response"}
     result = await db.execute(select(SemanticModel).where(SemanticModel.dataset_id == dataset.id))
     columns = result.scalars().all()
     columns = list(columns)

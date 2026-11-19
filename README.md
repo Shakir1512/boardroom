@@ -1,5 +1,15 @@
 # Boardroom Analytics Copilot
 
+## Start the application
+
+After installing backend and frontend dependencies, start both services from the repository root:
+
+```powershell
+.\start-boardroom.ps1
+```
+
+The script starts the API on `http://localhost:8000` and the UI on `http://localhost:5173`. Use `-BackendPort` or `-FrontendPort` to override either port. The seeded local login is `admin@boardroom.local` / `admin123`.
+
 The application is focused on the hackathon use case: upload raw CSV/SQLite data, inspect schema and data health, ask questions through validated read-only SQL, review generated bar/line/scatter charts and IQR outlier callouts, then save and export an executive report as Markdown or PDF.
 
 ## Generate the hackathon fixture

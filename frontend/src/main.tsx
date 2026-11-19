@@ -5,11 +5,13 @@ import { QueryClient, QueryClientProvider, useQuery, useMutation } from "@tansta
 import ReactECharts from "echarts-for-react";
 import {
   BarChart3, Database, ShieldCheck, Sparkles, FileText, History, LayoutDashboard, Upload, Search,
-  LogOut, ChevronDown, Download,
+  LogOut, ChevronDown, Download, Activity, AlertTriangle, Target,
 } from "lucide-react";
 import "./styles.css";
 import "./analysis.css";
 import "./chat.css";
+import "./executive.css";
+import "./deep-dive.css";
 
 const queryClient = new QueryClient();
 const API = "";
@@ -81,7 +83,9 @@ function Login() {
 }
 
 const nav = [
-  { path: "/", label: "Overview", icon: LayoutDashboard },
+  { path: "/", label: "Decision Center", icon: LayoutDashboard },
+  { path: "/executive", label: "Executive Report", icon: Target },
+  { path: "/analytics", label: "Analytics", icon: BarChart3 },
   { path: "/data", label: "Data Workspace", icon: Database },
   { path: "/health", label: "Data Health", icon: ShieldCheck },
   { path: "/ask", label: "Ask Analytics", icon: Sparkles },
@@ -104,13 +108,15 @@ function Shell({ user }: { user: User }) {
         <div className="header-actions"><div className="avatar">{user.full_name.slice(0, 1)}</div><div><strong>{user.full_name}</strong><span>{user.is_superuser ? "Super Administrator" : "Workspace Member"}</span></div><button className="icon-button" title="Sign out" onClick={() => { localStorage.removeItem("boardroom_token"); window.location.reload(); }}><LogOut size={17}/></button></div>
       </header>
       <Routes>
-        <Route path="/" element={<Overview workspaceId={workspace.data?.[0]?.id}/>} />
+        <Route path="/" element={<ExecutiveDecision workspaceId={workspace.data?.[0]?.id} view="decision"/>} />
+        <Route path="/executive" element={<ExecutiveDecision workspaceId={workspace.data?.[0]?.id} view="report"/>} />
+        <Route path="/analytics" element={<AnalyticalDeepDive workspaceId={workspace.data?.[0]?.id}/>} />
         <Route path="/data" element={<DataWorkspace workspaceId={workspace.data?.[0]?.id}/>} />
         <Route path="/health" element={<DataHealth workspaceId={workspace.data?.[0]?.id}/>} />
         <Route path="/ask" element={<AskAnalytics workspaceId={workspace.data?.[0]?.id} user={user}/>} />
         <Route path="/reports" element={<Reports workspaceId={workspace.data?.[0]?.id}/>} />
         <Route path="/runs" element={<Runs workspaceId={workspace.data?.[0]?.id}/>} />
-        <Route path="*" element={<Overview workspaceId={workspace.data?.[0]?.id}/>} />
+        <Route path="*" element={<ExecutiveDecision workspaceId={workspace.data?.[0]?.id} view="decision"/>} />
       </Routes>
     </div>
   </div>;
@@ -118,6 +124,62 @@ function Shell({ user }: { user: User }) {
 
 function Page({ title, subtitle, action, children }: { title: string; subtitle: string; action?: React.ReactNode; children: React.ReactNode }) {
   return <section className="page"><div className="page-head"><div><p className="eyebrow">BOARDROOM WORKSPACE</p><h1>{title}</h1><p>{subtitle}</p></div>{action}</div>{children}</section>;
+}
+
+const displayValue=(value:number, unit:string)=>unit==="percent"?`${value.toFixed(1)}%`:unit==="currency"?new Intl.NumberFormat(undefined,{maximumFractionDigits:0}).format(value):new Intl.NumberFormat().format(value);
+
+async function downloadExecutiveReport(datasetId:string, format:"markdown"|"pdf") {
+  const token=localStorage.getItem("boardroom_token");
+  const response=await fetch(`/api/v1/executive/datasets/${datasetId}/export?format=${format}`,{headers:token?{Authorization:`Bearer ${token}`}:{}});
+  if(!response.ok) throw new Error("Executive report export failed");
+  const url=URL.createObjectURL(await response.blob()); const anchor=document.createElement("a");
+  anchor.href=url; anchor.download=`executive-decision-report.${format==="pdf"?"pdf":"md"}`; anchor.click(); window.setTimeout(()=>URL.revokeObjectURL(url),1000);
+}
+
+function ExecutiveDecision({ workspaceId, view }: { workspaceId?: string; view: "decision" | "report" }) {
+  const datasets=useQuery({queryKey:["executive-datasets",workspaceId],queryFn:()=>api<Dataset[]>(`/api/v1/datasets${workspaceId?`?workspace_id=${workspaceId}`:""}`)});
+  const [datasetId,setDatasetId]=useState("");
+  const effective=datasetId||datasets.data?.[0]?.id;
+  const report=useQuery({queryKey:["executive-analysis",effective],enabled:!!effective,queryFn:()=>api<any>(`/api/v1/executive/datasets/${effective}`)});
+  const [scenarioMetric,setScenarioMetric]=useState(""); const [scenarioChange,setScenarioChange]=useState(5);
+  const [exportError,setExportError]=useState("");
+  const scenario=useMutation({mutationFn:()=>api<any>("/api/v1/executive/scenario",{method:"POST",body:JSON.stringify({dataset_id:effective,metric_key:scenarioMetric||report.data?.kpis?.[0]?.key,change_percent:scenarioChange})})});
+  const data=report.data;
+  const trendOption=data?.trend?.length?{tooltip:{trigger:"axis",valueFormatter:(v:number)=>v.toLocaleString()},grid:{left:58,right:26,top:25,bottom:42},xAxis:{type:"category",name:"Month",data:data.trend.map((x:any)=>x.period)},yAxis:{type:"value",name:"Value"},series:[{name:"Verified revenue",type:"line",smooth:true,data:data.trend.map((x:any)=>x.value),areaStyle:{color:"#315efb18"},lineStyle:{color:"#315efb",width:3},itemStyle:{color:"#315efb"}}]}:null;
+  return <Page title={view==="report"?"Executive Report":"Leadership Decision Center"} subtitle={view==="report"?"A presentation-ready narrative with supporting evidence":"Prioritized risks, opportunities, and leadership actions"} action={datasets.data?.length?<div className="executive-actions"><label>Dataset<select value={effective||""} onChange={e=>{setDatasetId(e.target.value);scenario.reset();}}>{datasets.data.map(d=><option key={d.id} value={d.id}>{d.name}</option>)}</select></label><button className="secondary" onClick={()=>effective&&downloadExecutiveReport(effective,"markdown").catch(e=>setExportError(e.message))}><Download size={15}/> Markdown</button><button className="primary" onClick={()=>effective&&downloadExecutiveReport(effective,"pdf").catch(e=>setExportError(e.message))}><Download size={15}/> PDF</button></div>:undefined}>
+    {exportError&&<div className="error">{exportError}</div>}
+    {!datasets.isLoading&&!datasets.data?.length&&<div className="empty">Upload a CSV or SQLite dataset in Data Workspace to generate an executive briefing.</div>}
+    {report.isLoading&&<div className="empty">Calculating verified KPIs, changes, and risk signals…</div>}
+    {report.isError&&<div className="error">{report.error.message}</div>}
+    {data&&<>
+      <article className="executive-hero"><div><span className="eyebrow">{data.dataset.domain} · {data.dataset.records.toLocaleString()} records</span><h2>{view==="report"?"Executive briefing":"Decisions requiring leadership attention"}</h2><p>{view==="report"?data.briefing:(data.alerts.length?`${data.alerts[0].title}: ${data.alerts[0].detail}`:data.briefing)}</p><small>Generated {new Date(data.dataset.generated_at).toLocaleString()} · Data quality: {data.quality.status}{data.quality.score!==null?` (${data.quality.score.toFixed(1)}%)`:""}</small></div><div className="health-orb"><strong>{data.health.score===null?"—":data.health.score}</strong><span>Business health</span><small>Only applicable dimensions</small></div></article>
+      <div className="stat-grid executive-kpis">{data.kpis.slice(0,6).map((k:any)=><article className="stat-card" key={k.key}><span>{k.label}</span><strong>{displayValue(k.value,k.unit)}</strong>{k.change_percent!==undefined&&<small className={k.change_percent>=0?"positive":"negative"}>{k.change_percent>=0?"▲":"▼"} {Math.abs(k.change_percent).toFixed(1)}% vs prior period</small>}<small title={k.calculation}>Evidence: {k.calculation}</small></article>)}</div>
+      <div className="grid-two executive-grid"><article className="panel"><div className="panel-head"><div><h2>Performance trend</h2><p>Verified monthly aggregation; use filters in Ask Analytics for deeper cuts.</p></div><Activity size={18}/></div>{trendOption?<ReactECharts option={trendOption} style={{height:300}}/>:<div className="empty">A revenue measure and valid date column are required for a trend.</div>}</article>
+      <article className="panel"><div className="panel-head"><div><h2>Health methodology</h2><p>Performance and reliability are deliberately distinct.</p></div></div>{data.health.dimensions.length?<div className="health-list">{data.health.dimensions.map((d:any)=><div key={d.name}><div><strong>{d.name}</strong><span>{d.score.toFixed(1)} / 100</span></div><div className="meter"><i style={{width:`${d.score}%`}}/></div><small>{d.basis}</small></div>)}</div>:<div className="empty">Not enough comparable measures for a health score.</div>}</article></div>
+      <div className="grid-two executive-grid"><article className="panel"><div className="panel-head"><div><h2>What changed & why</h2><p>Measured contributions, not causal claims.</p></div></div><div className="evidence-list">{data.evidence.slice(0,4).map((item:any,i:number)=><details key={i} open={i===0}><summary><span className={`evidence-type ${item.type.replace(" ","-").toLowerCase()}`}>{item.type}</span><strong>{item.title}</strong><span className={`severity ${item.severity}`}>{item.severity}</span></summary><p>{item.finding}</p>{item.drivers&&<div className="driver-list">{item.drivers.map((driver:any)=><span key={driver.segment}>{driver.segment}: <strong>{driver.contribution>=0?"+":""}{driver.contribution.toLocaleString()}</strong></span>)}<small>Unexplained residual: {item.residual.toLocaleString()}</small></div>}<code>{item.calculation}</code></details>)}</div></article>
+      <article className="panel"><div className="panel-head"><div><h2>Risk radar</h2><p>Statistical exceptions require business investigation.</p></div><AlertTriangle size={18}/></div>{data.alerts.length?<div className="alert-list">{data.alerts.map((a:any,i:number)=><div className={`alert ${a.severity.toLowerCase()}`} key={i}><strong>{a.severity} · {a.title}</strong><span>{a.detail}</span></div>)}</div>:<div className="empty">No prioritized alerts from the available signals.</div>}<div className="anomaly-note">{data.anomalies.length?`${data.anomalies.length} measured outlier signal(s) detected using disclosed IQR baselines.`:"No IQR anomaly signals met the minimum observation threshold."}</div></article></div>
+      {view==="decision"&&<div className="grid-two executive-grid"><article className="panel scenario-panel"><div className="panel-head"><div><h2>Scenario Lab</h2><p>Mathematical sensitivity, not a validated forecast.</p></div></div>{data.kpis.length?<><div className="scenario-controls"><label>KPI<select value={scenarioMetric||data.kpis[0].key} onChange={e=>setScenarioMetric(e.target.value)}>{data.kpis.map((k:any)=><option key={k.key} value={k.key}>{k.label}</option>)}</select></label><label>Assumption: {scenarioChange}%<input type="range" min="-30" max="30" value={scenarioChange} onChange={e=>setScenarioChange(+e.target.value)}/></label><button className="primary" onClick={()=>scenario.mutate()} disabled={scenario.isPending}>{scenario.isPending?"Simulating…":"Run scenario"}</button></div>{scenario.data&&<div className="scenario-result"><span>Baseline <strong>{scenario.data.baseline.toLocaleString()}</strong></span><span>Simulated <strong>{scenario.data.simulated.toLocaleString()}</strong></span><span>Difference <strong>{scenario.data.difference>=0?"+":""}{scenario.data.difference.toLocaleString()}</strong></span><small>{scenario.data.assumptions}</small></div>}</>:<div className="empty">No supported KPI is available for simulation.</div>}</article>
+      <article className="panel"><div className="panel-head"><div><h2>Trust & limitations</h2><p>How to read this report.</p></div></div><div className="methodology"><p>{data.methodology}</p><p><strong>Evidence trace:</strong> open any finding to review its deterministic calculation. Run Data Health to refresh the reliability component.</p><p><strong>Forecasting:</strong> unavailable unless there is sufficient validated historical data; no prediction is fabricated.</p></div></article></div>}
+    </>}
+  </Page>;
+}
+
+function AnalyticalDeepDive({ workspaceId }: { workspaceId?: string }) {
+  const datasets=useQuery({queryKey:["deep-dive-datasets",workspaceId],queryFn:()=>api<Dataset[]>(`/api/v1/datasets${workspaceId?`?workspace_id=${workspaceId}`:""}`)});
+  const [datasetId,setDatasetId]=useState(""); const effective=datasetId||datasets.data?.[0]?.id;
+  const deepDive=useQuery({queryKey:["deep-dive",effective],enabled:!!effective,queryFn:()=>api<any>(`/api/v1/executive/datasets/${effective}/deep-dive`)});
+  const data=deepDive.data;
+  const segment=data?.segments?.[0];
+  const segmentChart=segment?{tooltip:{trigger:"axis"},grid:{left:56,right:20,top:18,bottom:72},xAxis:{type:"category",data:segment.rows.map((x:any)=>x.segment),axisLabel:{rotate:segment.rows.length>6?30:0}},yAxis:{type:"value",name:segment.metric},series:[{type:"bar",data:segment.rows.map((x:any)=>x.value),itemStyle:{color:"#315efb",borderRadius:[4,4,0,0]}}]}:null;
+  return <Page title="Analytical Deep Dive" subtitle="Segments, distributions, correlations, and forecast readiness" action={datasets.data?.length?<label>Dataset<select value={effective||""} onChange={e=>setDatasetId(e.target.value)}>{datasets.data.map(d=><option key={d.id} value={d.id}>{d.name}</option>)}</select></label>:undefined}>
+    {!datasets.isLoading&&!datasets.data?.length&&<div className="empty">Upload a dataset to unlock analytical deep dives.</div>}
+    {deepDive.isLoading&&<div className="empty">Calculating descriptive statistics and segment comparisons…</div>}
+    {deepDive.isError&&<div className="error">{deepDive.error.message}</div>}
+    {data&&<><div className="grid-two executive-grid"><article className="panel"><div className="panel-head"><div><h2>Segment performance</h2><p>{segment?`${segment.metric} aggregated by ${segment.dimension}`:"No compatible measure and segment are available."}</p></div></div>{segmentChart?<ReactECharts option={segmentChart} style={{height:320}}/>:<div className="empty">A numeric measure and low-cardinality category are required.</div>}</article><article className="panel"><div className="panel-head"><div><h2>Forecast readiness</h2><p>Forecasts are only produced after validation.</p></div></div><div className="methodology"><p><strong>{data.forecast.available?"Available":"Not available"}</strong></p><p>{data.forecast.reason}</p>{data.forecast.observations!==undefined&&<p>Validated monthly observations: {data.forecast.observations}</p>}</div></article></div>
+      <article className="panel executive-grid"><div className="panel-head"><div><h2>Distribution & descriptive statistics</h2><p>Calculated from non-null numeric values; no imputation is applied.</p></div></div>{data.statistics.length?<table><thead><tr><th>Measure</th><th>Count</th><th>Missing</th><th>Mean</th><th>Median</th><th>Std. dev.</th><th>P25–P75</th></tr></thead><tbody>{data.statistics.map((item:any)=><tr key={item.column}><td><strong>{item.column}</strong></td><td>{item.count.toLocaleString()}</td><td>{item.missing.toLocaleString()}</td><td>{item.mean.toLocaleString(undefined,{maximumFractionDigits:2})}</td><td>{item.median.toLocaleString(undefined,{maximumFractionDigits:2})}</td><td>{item.std_dev.toLocaleString(undefined,{maximumFractionDigits:2})}</td><td>{item.p25.toLocaleString(undefined,{maximumFractionDigits:2})} – {item.p75.toLocaleString(undefined,{maximumFractionDigits:2})}</td></tr>)}</tbody></table>:<div className="empty">No numeric measures were detected.</div>}</article>
+      <div className="grid-two"><article className="panel"><div className="panel-head"><div><h2>Correlation signals</h2><p>Associations to investigate, never causal evidence.</p></div></div>{data.correlations.length?<div className="evidence-list">{data.correlations.map((item:any,index:number)=><div key={index}><strong>{item.left} ↔ {item.right}</strong><span className="tag">{item.coefficient.toFixed(2)} · {item.strength}</span><p>{item.note}</p></div>)}</div>:<div className="empty">No moderate or strong paired correlations were found.</div>}</article><article className="panel"><div className="panel-head"><div><h2>Available segment cuts</h2><p>Top values are sorted by the selected business measure.</p></div></div><div className="evidence-list">{data.segments.slice(1).map((item:any)=><details key={item.dimension}><summary><strong>{item.dimension}</strong><span className="tag">{item.metric}</span></summary><table><thead><tr><th>Segment</th><th>Total</th><th>Average</th><th>Records</th></tr></thead><tbody>{item.rows.map((row:any)=><tr key={row.segment}><td>{row.segment}</td><td>{row.value.toLocaleString()}</td><td>{row.average.toLocaleString(undefined,{maximumFractionDigits:2})}</td><td>{row.records}</td></tr>)}</tbody></table></details>)}</div></article></div>
+    </>}
+  </Page>;
 }
 
 function Overview({ workspaceId }: { workspaceId?: string }) {
