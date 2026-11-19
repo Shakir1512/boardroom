@@ -7,7 +7,6 @@ __pycache__/
 *.db
 *.sqlite
 uploads/
-data/
 .venv/
 venv/
 *.egg-info/
