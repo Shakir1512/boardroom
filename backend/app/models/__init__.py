@@ -7,7 +7,7 @@ from .workspace import Workspace
 from .role import Role
 from .permission import Permission, RolePermission, UserRole
 from .dataset import Dataset, DatasetAccess, DatasetVersion
-from .schema import SemanticModel, ColumnProfile
+from .schema import SemanticModel, ColumnProfile, SchemaApproval
 from .quality import QualityReport
 from .analytics import AnalyticsRun, RunStep
 from .conversation import Conversation, ChatMessage
@@ -31,6 +31,7 @@ __all__ = [
     "DatasetVersion",
     "SemanticModel",
     "ColumnProfile",
+    "SchemaApproval",
     "QualityReport",
     "AnalyticsRun",
     "RunStep",

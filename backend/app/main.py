@@ -23,7 +23,7 @@ from app.database import close_db, get_db, init_db
 from app.models import (
     AIModel, AIProvider, AnalyticsRun, AuditLog, ChatMessage, Conversation,
     Dataset, Organization, Permission, QualityReport, Report, Role,
-    RolePermission, SemanticModel, UsageLedger, User, UserRole, Workspace,
+    RolePermission, SchemaApproval, SemanticModel, UsageLedger, User, UserRole, Workspace,
 )
 from app.security.auth import (
     create_access_token, create_refresh_token, get_current_user,
@@ -98,6 +98,12 @@ class ScenarioRequest(BaseModel):
     dataset_id: str
     metric_key: str
     change_percent: float
+
+
+class SchemaApprovalRequest(BaseModel):
+    columns: list[dict[str, Any]]
+    primary_date_column: str | None = None
+    domain: str | None = None
 
 
 async def audit(db: AsyncSession, user: User, action: str, resource_type: str,
@@ -915,6 +921,78 @@ async def get_schema(
              "is_pii": m.is_pii, "is_nullable": m.is_nullable,
              "unique_count": m.unique_count, "null_count": m.null_count,
              "sample_values": m.sample_values} for m in models]
+
+
+def schema_explanation(column: SemanticModel) -> tuple[str, str, bool]:
+    """Explain inferred field roles without claiming certainty beyond observed metadata."""
+    name = column.column_name.lower()
+    pii = column.semantic_type in {"email", "phone"} or any(word in name for word in ("email", "phone", "mobile", "address"))
+    if pii:
+        return "sensitive", "Name pattern indicates potential personally identifiable information; mask it in prompts and exports.", True
+    if column.semantic_type == "datetime":
+        return "time", f"Detected as a date/time field from its name and parseable values; {column.null_count or 0} null value(s) need review.", False
+    if column.semantic_type == "identifier":
+        return "identifier", f"Name and uniqueness pattern indicate a record identifier ({column.unique_count or 0} distinct values).", False
+    if column.semantic_type == "measure":
+        business_role = "revenue" if any(word in name for word in ("revenue", "sales", "gross_sales", "net_sales", "mrr")) else "measure"
+        return business_role, f"Numeric distribution supports aggregation; {column.null_count or 0} null value(s) are excluded from calculations.", False
+    return "dimension", f"Low-cardinality categorical field with {column.unique_count or 0} distinct value(s), suitable for segment analysis.", False
+
+
+def schema_readiness(columns: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    included = [column for column in columns if column.get("include", True)]
+    roles = {column.get("role") for column in included}
+    has_time = "time" in roles
+    has_revenue = "revenue" in roles
+    has_measure = has_revenue or "measure" in roles
+    has_identifier = "identifier" in roles
+    return [
+        {"use_case": "Executive reporting", "ready": has_measure, "score": 92 if has_measure else 35,
+         "reason": "A revenue or numeric business measure is approved." if has_measure else "Approve at least one business measure to generate KPI scorecards."},
+        {"use_case": "Trend analysis", "ready": has_measure and has_time, "score": 90 if has_measure and has_time else 45,
+         "reason": "Approved time and measure fields support comparable period trends." if has_measure and has_time else "Approve a reporting date and a numeric measure for trends."},
+        {"use_case": "Customer analysis", "ready": has_identifier, "score": 88 if has_identifier else 40,
+         "reason": "An approved identifier supports distinct-count and segment analysis." if has_identifier else "Approve a customer, order, or account identifier."},
+        {"use_case": "Forecasting", "ready": False, "score": 0,
+         "reason": "Requires an approved time series with sufficient validated monthly history; model validation is still required."},
+    ]
+
+
+@app.get("/api/v1/schema/datasets/{dataset_id}/approval")
+async def get_schema_approval(dataset_id: str, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    dataset = await get_authorized_dataset(dataset_id, user, db)
+    from sqlalchemy import desc
+    models = list((await db.execute(select(SemanticModel).where(SemanticModel.dataset_id == dataset.id))).scalars().all())
+    approval = (await db.execute(select(SchemaApproval).where(SchemaApproval.dataset_id == dataset.id).order_by(desc(SchemaApproval.version_number)).limit(1))).scalar_one_or_none()
+    saved = {item["column_name"]: item for item in (approval.contract.get("columns", []) if approval else [])}
+    columns=[]
+    for model in models:
+        role, reason, pii = schema_explanation(model)
+        stored=saved.get(model.column_name,{})
+        columns.append({"column_name":model.column_name,"data_type":model.data_type,"unique_count":model.unique_count,"null_count":model.null_count,"role":stored.get("role",role),"include":stored.get("include",True),"is_pii":stored.get("is_pii",pii),"reason":reason})
+    return {"dataset_id":dataset.id,"dataset_name":dataset.name,"domain":approval.contract.get("domain") if approval else detect_business_domain(models),"status":approval.status if approval else "pending_approval","version":approval.version_number if approval else 0,"primary_date_column":approval.contract.get("primary_date_column") if approval else next((item["column_name"] for item in columns if item["role"]=="time"),None),"columns":columns,"readiness":schema_readiness(columns),"approval_note":"Raw uploaded data is retained unchanged. This approval controls semantic meaning and analytical eligibility."}
+
+
+@app.post("/api/v1/schema/datasets/{dataset_id}/approval")
+async def approve_schema(dataset_id: str, payload: SchemaApprovalRequest, user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    dataset = await get_authorized_dataset(dataset_id, user, db, require_write=True)
+    models=list((await db.execute(select(SemanticModel).where(SemanticModel.dataset_id == dataset.id))).scalars().all())
+    known={model.column_name:model for model in models}
+    approved=[]
+    for item in payload.columns:
+        name=item.get("column_name")
+        if name not in known: raise HTTPException(status_code=422,detail=f"Unknown schema column: {name}")
+        role=item.get("role","dimension")
+        if role not in {"time","revenue","measure","dimension","identifier","sensitive","ignored"}: raise HTTPException(status_code=422,detail=f"Unsupported role for {name}")
+        include=bool(item.get("include",role not in {"ignored","sensitive"}))
+        model=known[name]; model.semantic_type={"time":"datetime","revenue":"measure","measure":"measure","dimension":"category","identifier":"identifier","sensitive":"email","ignored":"ignored"}[role]; model.is_pii=bool(item.get("is_pii",role=="sensitive")); model.description=f"Approved business role: {role}"
+        approved.append({"column_name":name,"role":role,"include":include,"is_pii":model.is_pii})
+    from sqlalchemy import func
+    prior=(await db.execute(select(func.max(SchemaApproval.version_number)).where(SchemaApproval.dataset_id == dataset.id))).scalar_one() or 0
+    contract={"domain":payload.domain or detect_business_domain(models),"primary_date_column":payload.primary_date_column,"columns":approved,"approved_at":datetime.now(timezone.utc).isoformat()}
+    record=SchemaApproval(dataset_id=dataset.id,version_number=prior+1,status="approved",contract=contract,approved_by=user.id)
+    db.add(record); await audit(db,user,"schema.approve","dataset",dataset.id,{"version":record.version_number,"columns":len(approved)}); await db.commit()
+    return {"status":"approved","version":record.version_number,"contract":contract,"readiness":schema_readiness(approved)}
 
 
 @app.post("/api/v1/quality/datasets/{dataset_id}/scan")

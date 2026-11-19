@@ -12,6 +12,7 @@ import "./analysis.css";
 import "./chat.css";
 import "./executive.css";
 import "./deep-dive.css";
+import "./schema.css";
 
 const queryClient = new QueryClient();
 const API = "";
@@ -87,6 +88,7 @@ const nav = [
   { path: "/executive", label: "Executive Report", icon: Target },
   { path: "/analytics", label: "Analytics", icon: BarChart3 },
   { path: "/data", label: "Data Workspace", icon: Database },
+  { path: "/schema", label: "Schema Approval", icon: ShieldCheck },
   { path: "/health", label: "Data Health", icon: ShieldCheck },
   { path: "/ask", label: "Ask Analytics", icon: Sparkles },
   { path: "/reports", label: "Report Studio", icon: FileText },
@@ -112,6 +114,7 @@ function Shell({ user }: { user: User }) {
         <Route path="/executive" element={<ExecutiveDecision workspaceId={workspace.data?.[0]?.id} view="report"/>} />
         <Route path="/analytics" element={<AnalyticalDeepDive workspaceId={workspace.data?.[0]?.id}/>} />
         <Route path="/data" element={<DataWorkspace workspaceId={workspace.data?.[0]?.id}/>} />
+        <Route path="/schema" element={<SchemaApproval workspaceId={workspace.data?.[0]?.id}/>} />
         <Route path="/health" element={<DataHealth workspaceId={workspace.data?.[0]?.id}/>} />
         <Route path="/ask" element={<AskAnalytics workspaceId={workspace.data?.[0]?.id} user={user}/>} />
         <Route path="/reports" element={<Reports workspaceId={workspace.data?.[0]?.id}/>} />
@@ -220,6 +223,26 @@ function DataWorkspace({ workspaceId }: { workspaceId?: string }) {
     <article className="panel"><div className="panel-head"><div><h2>Datasets</h2><p>{datasets.data?.length || 0} sources in this workspace</p></div></div>
       {datasets.isLoading ? <div className="empty">Loading…</div> : datasets.data?.length ? <table><thead><tr><th>Name</th><th>Type</th><th>Rows</th><th>Status</th><th></th></tr></thead><tbody>{datasets.data.map(d=><tr key={d.id} className={selected===d.id?"selected":""} onClick={()=>setSelected(d.id)}><td><strong>{d.name}</strong></td><td>{d.file_type.toUpperCase()}</td><td>{d.row_count?.toLocaleString()}</td><td><span className={`status ${d.status}`}>{d.status}</span></td><td><button className="icon-button" title="Select dataset"><Search size={15}/></button></td></tr>)}</tbody></table> : <div className="drop-zone"><Upload/><strong>Upload a CSV or SQLite file</strong><span>Schema profiling starts automatically</span></div>}
     </article>
+  </Page>;
+}
+
+function SchemaApproval({ workspaceId }: { workspaceId?: string }) {
+  const datasets=useQuery({queryKey:["schema-approval-datasets",workspaceId],queryFn:()=>api<Dataset[]>(`/api/v1/datasets${workspaceId?`?workspace_id=${workspaceId}`:""}`)});
+  const [datasetId,setDatasetId]=useState(""); const effective=datasetId||datasets.data?.[0]?.id;
+  const approval=useQuery({queryKey:["schema-approval",effective],enabled:!!effective,queryFn:()=>api<any>(`/api/v1/schema/datasets/${effective}/approval`)});
+  const [columns,setColumns]=useState<any[]>([]); const [domain,setDomain]=useState(""); const [dateColumn,setDateColumn]=useState("");
+  useEffect(()=>{if(approval.data){setColumns(approval.data.columns);setDomain(approval.data.domain||"");setDateColumn(approval.data.primary_date_column||"");}},[approval.data]);
+  const save=useMutation({mutationFn:()=>api<any>(`/api/v1/schema/datasets/${effective}/approval`,{method:"POST",body:JSON.stringify({columns,domain,primary_date_column:dateColumn||null})}),onSuccess:()=>{approval.refetch();queryClient.invalidateQueries({queryKey:["schema",effective]});}});
+  const update=(index:number,field:string,value:any)=>setColumns(current=>current.map((column,i)=>i===index?{...column,[field]:value}:column));
+  return <Page title="Schema Approval" subtitle="Approve an explainable data contract before executive analysis" action={datasets.data?.length?<label>Dataset<select value={effective||""} onChange={e=>setDatasetId(e.target.value)}>{datasets.data.map(d=><option key={d.id} value={d.id}>{d.name}</option>)}</select></label>:undefined}>
+    {!datasets.isLoading&&!datasets.data?.length&&<div className="empty">Upload a CSV or SQLite dataset to start schema approval.</div>}
+    {approval.isLoading&&<div className="empty">Profiling inferred business meaning…</div>}
+    {approval.isError&&<div className="error">{approval.error.message}</div>}
+    {approval.data&&<><article className="executive-hero schema-hero"><div><span className="eyebrow">{approval.data.status==="approved"?`Approved contract v${approval.data.version}`:"Approval required"}</span><h2>{approval.data.domain}</h2><p>Review the inferred roles, then approve the business contract. Raw source data remains unchanged; approval controls how analysis interprets it.</p></div><div className="health-orb"><strong>{approval.data.readiness.filter((x:any)=>x.ready).length}/4</strong><span>Use cases ready</span></div></article>
+      <div className="stat-grid executive-kpis">{approval.data.readiness.map((item:any)=><article className="stat-card" key={item.use_case}><span>{item.use_case}</span><strong>{item.score}%</strong><small className={item.ready?"positive":"negative"}>{item.ready?"Ready after approval":"Needs fields or validation"}</small><small>{item.reason}</small></article>)}</div>
+      <div className="grid-two executive-grid"><article className="panel"><div className="panel-head"><div><h2>Business settings</h2><p>These choices define time comparisons and domain-aware KPIs.</p></div></div><div className="schema-settings"><label>Business domain<input value={domain} onChange={e=>setDomain(e.target.value)} placeholder="E-commerce, SaaS, finance…"/></label><label>Primary reporting date<select value={dateColumn} onChange={e=>setDateColumn(e.target.value)}><option value="">No approved date column</option>{columns.filter(c=>c.role==="time").map(c=><option value={c.column_name} key={c.column_name}>{c.column_name}</option>)}</select></label></div></article><article className="panel"><div className="panel-head"><div><h2>Governance promise</h2><p>What approval changes.</p></div></div><div className="methodology"><p><strong>Raw files are immutable.</strong> This contract stores business meaning, not a destructive data rewrite.</p><p>Sensitive fields can be excluded from reports, AI prompts, and exports.</p><p>Each approval creates a versioned, auditable contract.</p></div></article></div>
+      <article className="panel"><div className="panel-head"><div><h2>Explainable field mapping</h2><p>Every suggestion includes the observed reason. Set a role, include it, then approve.</p></div><button className="primary" onClick={()=>save.mutate()} disabled={save.isPending}>{save.isPending?"Approving…":"Approve schema"}</button></div>{save.isError&&<div className="error">{save.error.message}</div>}{save.isSuccess&&<div className="success">Schema contract v{save.data.version} approved. Reporting will use the approved field roles.</div>}<table className="schema-table"><thead><tr><th>Source column</th><th>Role</th><th>Include</th><th>Sensitive</th><th>Why this was inferred</th><th>Coverage</th></tr></thead><tbody>{columns.map((column,index)=><tr key={column.column_name}><td><strong>{column.column_name}</strong><small>{column.data_type}</small></td><td><select value={column.role} onChange={e=>update(index,"role",e.target.value)}><option value="time">Time</option><option value="revenue">Revenue</option><option value="measure">Measure</option><option value="dimension">Dimension</option><option value="identifier">Identifier</option><option value="sensitive">Sensitive</option><option value="ignored">Ignore</option></select></td><td><input type="checkbox" checked={column.include} onChange={e=>update(index,"include",e.target.checked)}/></td><td><input type="checkbox" checked={column.is_pii} onChange={e=>update(index,"is_pii",e.target.checked)}/></td><td>{column.reason}</td><td>{(column.unique_count??0).toLocaleString()} distinct<br/>{(column.null_count??0).toLocaleString()} missing</td></tr>)}</tbody></table></article>
+    </>}
   </Page>;
 }
 

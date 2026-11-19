@@ -45,3 +45,18 @@ class ColumnProfile(TimestampMixin, Base):
 
     # Relationships
     semantic_model = relationship("SemanticModel", back_populates="column_profile", lazy="selectin")
+
+
+class SchemaApproval(TimestampMixin, Base):
+    """Versioned, user-approved business contract for an uploaded dataset."""
+    __tablename__ = "schema_approvals"
+
+    dataset_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("datasets.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    version_number: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    status: Mapped[str] = mapped_column(String(50), nullable=False, default="approved")
+    contract: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    approved_by: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
