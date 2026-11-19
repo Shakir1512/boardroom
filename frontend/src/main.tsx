@@ -6,6 +6,7 @@ import ReactECharts from "echarts-for-react";
 import {
   BarChart3, Database, ShieldCheck, Sparkles, FileText, History, LayoutDashboard, Upload, Search,
   LogOut, ChevronDown, Download, Activity, AlertTriangle, Target,
+  ArrowRight, CheckCircle2, X, Shield,
 } from "lucide-react";
 import "./styles.css";
 import "./analysis.css";
@@ -13,9 +14,14 @@ import "./chat.css";
 import "./executive.css";
 import "./deep-dive.css";
 import "./schema.css";
+import "./premium.css";
+import "./polish.css";
+import "./brand-theme.css";
+import "./brand-fixes.css";
 
 const queryClient = new QueryClient();
 const API = "";
+const CHART_COLORS = { primary: "#003049", secondary: "#F77F00", positive: "#003049", negative: "#D62828", highlight: "#FCBF49", critical: "#E0003C", area: "#EAE2B7" };
 
 async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   const token = localStorage.getItem("boardroom_token");
@@ -146,16 +152,17 @@ function ExecutiveDecision({ workspaceId, view }: { workspaceId?: string; view: 
   const report=useQuery({queryKey:["executive-analysis",effective],enabled:!!effective,queryFn:()=>api<any>(`/api/v1/executive/datasets/${effective}`)});
   const [scenarioMetric,setScenarioMetric]=useState(""); const [scenarioChange,setScenarioChange]=useState(5);
   const [exportError,setExportError]=useState("");
+  const [evidenceOpen,setEvidenceOpen]=useState(false);
   const scenario=useMutation({mutationFn:()=>api<any>("/api/v1/executive/scenario",{method:"POST",body:JSON.stringify({dataset_id:effective,metric_key:scenarioMetric||report.data?.kpis?.[0]?.key,change_percent:scenarioChange})})});
   const data=report.data;
-  const trendOption=data?.trend?.length?{tooltip:{trigger:"axis",valueFormatter:(v:number)=>v.toLocaleString()},grid:{left:58,right:26,top:25,bottom:42},xAxis:{type:"category",name:"Month",data:data.trend.map((x:any)=>x.period)},yAxis:{type:"value",name:"Value"},series:[{name:"Verified revenue",type:"line",smooth:true,data:data.trend.map((x:any)=>x.value),areaStyle:{color:"#315efb18"},lineStyle:{color:"#315efb",width:3},itemStyle:{color:"#315efb"}}]}:null;
+  const trendOption=data?.trend?.length?{color:[CHART_COLORS.primary,CHART_COLORS.secondary,CHART_COLORS.positive],tooltip:{trigger:"axis",valueFormatter:(v:number)=>v.toLocaleString()},grid:{left:58,right:26,top:25,bottom:42},xAxis:{type:"category",name:"Month",data:data.trend.map((x:any)=>x.period)},yAxis:{type:"value",name:"Value"},series:[{name:"Verified revenue",type:"line",smooth:true,data:data.trend.map((x:any)=>x.value),areaStyle:{color:CHART_COLORS.area},lineStyle:{color:CHART_COLORS.primary,width:3},itemStyle:{color:CHART_COLORS.primary}}]}:null;
   return <Page title={view==="report"?"Executive Report":"Leadership Decision Center"} subtitle={view==="report"?"A presentation-ready narrative with supporting evidence":"Prioritized risks, opportunities, and leadership actions"} action={datasets.data?.length?<div className="executive-actions"><label>Dataset<select value={effective||""} onChange={e=>{setDatasetId(e.target.value);scenario.reset();}}>{datasets.data.map(d=><option key={d.id} value={d.id}>{d.name}</option>)}</select></label><button className="secondary" onClick={()=>effective&&downloadExecutiveReport(effective,"markdown").catch(e=>setExportError(e.message))}><Download size={15}/> Markdown</button><button className="primary" onClick={()=>effective&&downloadExecutiveReport(effective,"pdf").catch(e=>setExportError(e.message))}><Download size={15}/> PDF</button></div>:undefined}>
     {exportError&&<div className="error">{exportError}</div>}
     {!datasets.isLoading&&!datasets.data?.length&&<div className="empty">Upload a CSV or SQLite dataset in Data Workspace to generate an executive briefing.</div>}
     {report.isLoading&&<div className="empty">Calculating verified KPIs, changes, and risk signals…</div>}
     {report.isError&&<div className="error">{report.error.message}</div>}
     {data&&<>
-      <article className="executive-hero"><div><span className="eyebrow">{data.dataset.domain} · {data.dataset.records.toLocaleString()} records</span><h2>{view==="report"?"Executive briefing":"Decisions requiring leadership attention"}</h2><p>{view==="report"?data.briefing:(data.alerts.length?`${data.alerts[0].title}: ${data.alerts[0].detail}`:data.briefing)}</p><small>Generated {new Date(data.dataset.generated_at).toLocaleString()} · Data quality: {data.quality.status}{data.quality.score!==null?` (${data.quality.score.toFixed(1)}%)`:""}</small></div><div className="health-orb"><strong>{data.health.score===null?"—":data.health.score}</strong><span>Business health</span><small>Only applicable dimensions</small></div></article>
+      <article className={`executive-hero boardroom-signal ${view}`}><div className="signal-copy"><span className="eyebrow">{view==="decision"?"BOARDROOM SIGNAL":"EXECUTIVE BRIEFING"} · {data.dataset.domain}</span><h2>{view==="report"?"The leadership narrative, backed by evidence.":"What leadership should know now."}</h2><p>{view==="report"?data.briefing:(data.alerts.length?`${data.alerts[0].title}: ${data.alerts[0].detail}`:data.briefing)}</p><div className="signal-actions"><button className="evidence-button" onClick={()=>setEvidenceOpen(true)}><Shield size={15}/> Show evidence <ArrowRight size={14}/></button><span>{data.dataset.records.toLocaleString()} records · {data.quality.status}{data.quality.score!==null?` ${data.quality.score.toFixed(0)}%`:""} reliable</span></div></div><div className="signal-priorities">{view==="decision"&&<><div className="priority-tile risk"><small>URGENT SIGNAL</small><strong>{data.alerts[0]?.title||"No critical risk detected"}</strong><span>{data.alerts[0]?.severity||"Informational"}</span></div><div className="priority-tile opportunity"><small>RECOMMENDED ACTION</small><strong>{data.evidence[1]?.title||"Review verified KPIs"}</strong><span>Open evidence before acting</span></div></>}<div className="health-orb"><strong>{data.health.score===null?"—":data.health.score}</strong><span>Business health</span><small>Only applicable dimensions</small></div></div></article>
       <div className="stat-grid executive-kpis">{data.kpis.slice(0,6).map((k:any)=><article className="stat-card" key={k.key}><span>{k.label}</span><strong>{displayValue(k.value,k.unit)}</strong>{k.change_percent!==undefined&&<small className={k.change_percent>=0?"positive":"negative"}>{k.change_percent>=0?"▲":"▼"} {Math.abs(k.change_percent).toFixed(1)}% vs prior period</small>}<small title={k.calculation}>Evidence: {k.calculation}</small></article>)}</div>
       <div className="grid-two executive-grid"><article className="panel"><div className="panel-head"><div><h2>Performance trend</h2><p>Verified monthly aggregation; use filters in Ask Analytics for deeper cuts.</p></div><Activity size={18}/></div>{trendOption?<ReactECharts option={trendOption} style={{height:300}}/>:<div className="empty">A revenue measure and valid date column are required for a trend.</div>}</article>
       <article className="panel"><div className="panel-head"><div><h2>Health methodology</h2><p>Performance and reliability are deliberately distinct.</p></div></div>{data.health.dimensions.length?<div className="health-list">{data.health.dimensions.map((d:any)=><div key={d.name}><div><strong>{d.name}</strong><span>{d.score.toFixed(1)} / 100</span></div><div className="meter"><i style={{width:`${d.score}%`}}/></div><small>{d.basis}</small></div>)}</div>:<div className="empty">Not enough comparable measures for a health score.</div>}</article></div>
@@ -163,6 +170,7 @@ function ExecutiveDecision({ workspaceId, view }: { workspaceId?: string; view: 
       <article className="panel"><div className="panel-head"><div><h2>Risk radar</h2><p>Statistical exceptions require business investigation.</p></div><AlertTriangle size={18}/></div>{data.alerts.length?<div className="alert-list">{data.alerts.map((a:any,i:number)=><div className={`alert ${a.severity.toLowerCase()}`} key={i}><strong>{a.severity} · {a.title}</strong><span>{a.detail}</span></div>)}</div>:<div className="empty">No prioritized alerts from the available signals.</div>}<div className="anomaly-note">{data.anomalies.length?`${data.anomalies.length} measured outlier signal(s) detected using disclosed IQR baselines.`:"No IQR anomaly signals met the minimum observation threshold."}</div></article></div>
       {view==="decision"&&<div className="grid-two executive-grid"><article className="panel scenario-panel"><div className="panel-head"><div><h2>Scenario Lab</h2><p>Mathematical sensitivity, not a validated forecast.</p></div></div>{data.kpis.length?<><div className="scenario-controls"><label>KPI<select value={scenarioMetric||data.kpis[0].key} onChange={e=>setScenarioMetric(e.target.value)}>{data.kpis.map((k:any)=><option key={k.key} value={k.key}>{k.label}</option>)}</select></label><label>Assumption: {scenarioChange}%<input type="range" min="-30" max="30" value={scenarioChange} onChange={e=>setScenarioChange(+e.target.value)}/></label><button className="primary" onClick={()=>scenario.mutate()} disabled={scenario.isPending}>{scenario.isPending?"Simulating…":"Run scenario"}</button></div>{scenario.data&&<div className="scenario-result"><span>Baseline <strong>{scenario.data.baseline.toLocaleString()}</strong></span><span>Simulated <strong>{scenario.data.simulated.toLocaleString()}</strong></span><span>Difference <strong>{scenario.data.difference>=0?"+":""}{scenario.data.difference.toLocaleString()}</strong></span><small>{scenario.data.assumptions}</small></div>}</>:<div className="empty">No supported KPI is available for simulation.</div>}</article>
       <article className="panel"><div className="panel-head"><div><h2>Trust & limitations</h2><p>How to read this report.</p></div></div><div className="methodology"><p>{data.methodology}</p><p><strong>Evidence trace:</strong> open any finding to review its deterministic calculation. Run Data Health to refresh the reliability component.</p><p><strong>Forecasting:</strong> unavailable unless there is sufficient validated historical data; no prediction is fabricated.</p></div></article></div>}
+      {evidenceOpen&&<div className="evidence-drawer-backdrop" role="dialog" aria-modal="true" aria-label="Evidence trace"><aside className="evidence-drawer"><button className="icon-button drawer-close" onClick={()=>setEvidenceOpen(false)} aria-label="Close evidence"><X size={17}/></button><p className="eyebrow">EVIDENCE TRACE</p><h2>Every claim has a calculation.</h2><p className="muted">These are verified calculations from the approved dataset. Interpretation is kept separate from evidence.</p>{data.evidence.map((item:any,index:number)=><article className="drawer-evidence" key={index}><span className="evidence-type">{item.type}</span><h3>{item.title}</h3><p>{item.finding}</p><code>{item.calculation}</code></article>)}</aside></div>}
     </>}
   </Page>;
 }
@@ -173,7 +181,7 @@ function AnalyticalDeepDive({ workspaceId }: { workspaceId?: string }) {
   const deepDive=useQuery({queryKey:["deep-dive",effective],enabled:!!effective,queryFn:()=>api<any>(`/api/v1/executive/datasets/${effective}/deep-dive`)});
   const data=deepDive.data;
   const segment=data?.segments?.[0];
-  const segmentChart=segment?{tooltip:{trigger:"axis"},grid:{left:56,right:20,top:18,bottom:72},xAxis:{type:"category",data:segment.rows.map((x:any)=>x.segment),axisLabel:{rotate:segment.rows.length>6?30:0}},yAxis:{type:"value",name:segment.metric},series:[{type:"bar",data:segment.rows.map((x:any)=>x.value),itemStyle:{color:"#315efb",borderRadius:[4,4,0,0]}}]}:null;
+  const segmentChart=segment?{color:[CHART_COLORS.secondary,CHART_COLORS.primary,CHART_COLORS.positive],tooltip:{trigger:"axis"},grid:{left:56,right:20,top:18,bottom:72},xAxis:{type:"category",data:segment.rows.map((x:any)=>x.segment),axisLabel:{rotate:segment.rows.length>6?30:0}},yAxis:{type:"value",name:segment.metric},series:[{type:"bar",data:segment.rows.map((x:any)=>x.value),itemStyle:{color:CHART_COLORS.secondary,borderRadius:[4,4,0,0]}}]}:null;
   return <Page title="Analytical Deep Dive" subtitle="Segments, distributions, correlations, and forecast readiness" action={datasets.data?.length?<label>Dataset<select value={effective||""} onChange={e=>setDatasetId(e.target.value)}>{datasets.data.map(d=><option key={d.id} value={d.id}>{d.name}</option>)}</select></label>:undefined}>
     {!datasets.isLoading&&!datasets.data?.length&&<div className="empty">Upload a dataset to unlock analytical deep dives.</div>}
     {deepDive.isLoading&&<div className="empty">Calculating descriptive statistics and segment comparisons…</div>}
@@ -198,7 +206,7 @@ function Overview({ workspaceId }: { workspaceId?: string }) {
     <div className="stat-grid">{stats.map(([label, value, note]) => <article className="stat-card" key={label}><span>{label}</span><strong>{value}</strong><small>{note}</small></article>)}</div>
     <div className="grid-two">
       <article className="panel"><div className="panel-head"><div><h2>Workspace activity</h2><p>Analytics and reporting utilization</p></div></div>
-        {overview.data?.activity ? <ReactECharts option={{ tooltip:{trigger:"axis"}, grid:{left:36,right:16,top:20,bottom:34}, xAxis:{type:"category",data:overview.data.activity.map((day:any)=>day.date.slice(5))}, yAxis:{type:"value",minInterval:1}, series:[{type:"bar",name:"Analytics runs",data:overview.data.activity.map((day:any)=>day.runs),itemStyle:{color:"#315efb"},barWidth:"38%",borderRadius:[4,4,0,0]}]}} style={{height:280}} /> : <div className="empty">Loading activity…</div>}
+        {overview.data?.activity ? <ReactECharts option={{ color:[CHART_COLORS.primary],tooltip:{trigger:"axis"}, grid:{left:36,right:16,top:20,bottom:34}, xAxis:{type:"category",data:overview.data.activity.map((day:any)=>day.date.slice(5))}, yAxis:{type:"value",minInterval:1}, series:[{type:"bar",name:"Analytics runs",data:overview.data.activity.map((day:any)=>day.runs),itemStyle:{color:CHART_COLORS.primary},barWidth:"38%",borderRadius:[4,4,0,0]}]}} style={{height:280}} /> : <div className="empty">Loading activity…</div>}
       </article>
       <article className="panel"><div className="panel-head"><div><h2>Datasets</h2><p>Recently available sources</p></div></div>
         {datasets.isLoading ? <div className="empty">Loading datasets…</div> : datasets.data?.length ? <div className="list">{datasets.data.map(d => <div className="list-row" key={d.id}><div className="file-icon"><Database size={17}/></div><div><strong>{d.name}</strong><span>{d.row_count?.toLocaleString()} rows · {d.file_type.toUpperCase()}</span></div><span className={`status ${d.status}`}>{d.status}</span></div>)}</div> : <div className="empty">No datasets uploaded yet</div>}
@@ -234,7 +242,7 @@ function SchemaApproval({ workspaceId }: { workspaceId?: string }) {
   useEffect(()=>{if(approval.data){setColumns(approval.data.columns);setDomain(approval.data.domain||"");setDateColumn(approval.data.primary_date_column||"");}},[approval.data]);
   const save=useMutation({mutationFn:()=>api<any>(`/api/v1/schema/datasets/${effective}/approval`,{method:"POST",body:JSON.stringify({columns,domain,primary_date_column:dateColumn||null})}),onSuccess:()=>{approval.refetch();queryClient.invalidateQueries({queryKey:["schema",effective]});}});
   const update=(index:number,field:string,value:any)=>setColumns(current=>current.map((column,i)=>i===index?{...column,[field]:value}:column));
-  return <Page title="Schema Approval" subtitle="Approve an explainable data contract before executive analysis" action={datasets.data?.length?<label>Dataset<select value={effective||""} onChange={e=>setDatasetId(e.target.value)}>{datasets.data.map(d=><option key={d.id} value={d.id}>{d.name}</option>)}</select></label>:undefined}>
+  return <Page title="Data Contract" subtitle="Approve the business meaning of raw data before executive analysis" action={datasets.data?.length?<label>Dataset<select value={effective||""} onChange={e=>setDatasetId(e.target.value)}>{datasets.data.map(d=><option key={d.id} value={d.id}>{d.name}</option>)}</select></label>:undefined}>
     {!datasets.isLoading&&!datasets.data?.length&&<div className="empty">Upload a CSV or SQLite dataset to start schema approval.</div>}
     {approval.isLoading&&<div className="empty">Profiling inferred business meaning…</div>}
     {approval.isError&&<div className="error">{approval.error.message}</div>}
@@ -253,7 +261,7 @@ function DataHealth({ workspaceId }: { workspaceId?: string }) {
   const schema=useQuery({queryKey:["schema",effective],enabled:!!effective,queryFn:()=>api<any[]>(`/api/v1/schema/datasets/${effective}`)});
   const report=useQuery({queryKey:["quality",effective],enabled:!!effective,queryFn:()=>api<any>(`/api/v1/quality/datasets/${effective}`).catch(()=>null)});
   const scan=useMutation({mutationFn:()=>api<any>(`/api/v1/quality/datasets/${effective}/scan`,{method:"POST"}),onSuccess:()=>report.refetch()});
-  return <Page title="Data Health" subtitle="Completeness, consistency and schema quality" action={effective?<button className="primary" onClick={()=>scan.mutate()} disabled={scan.isPending}>Run quality scan</button>:undefined}>
+  return <Page title="Data Confidence" subtitle="Know which conclusions are reliable before leadership acts" action={effective?<button className="primary" onClick={()=>scan.mutate()} disabled={scan.isPending}>Refresh confidence scan</button>:undefined}>
     {datasets.data?.length ? <div className="toolbar"><label>Dataset<select value={effective} onChange={e=>setDatasetId(e.target.value)}>{datasets.data.map(d=><option key={d.id} value={d.id}>{d.name}</option>)}</select></label></div>:<div className="empty">Upload a dataset to begin.</div>}
     {scan.isError&&<div className="error">{scan.error.message}</div>}
     {report.data && <div className="stat-grid three"><article className="stat-card"><span>Overall health</span><strong>{report.data.overall_score}%</strong></article><article className="stat-card"><span>Completeness</span><strong>{report.data.completeness_score}%</strong></article><article className="stat-card"><span>Consistency</span><strong>{report.data.consistency_score}%</strong></article></div>}
@@ -276,8 +284,8 @@ function analysisChartOption(chart: any) {
       name: chart.y_key,
       data: isScatter ? chart.data.map((point: any) => [point.x, point.y]) : chart.data.map((point: any) => point.y),
       smooth: chart.type === "line",
-      itemStyle: { color: "#315efb" },
-      areaStyle: chart.type === "line" ? { color: "#315efb18" } : undefined,
+      itemStyle: { color: CHART_COLORS.primary },
+      areaStyle: chart.type === "line" ? { color: CHART_COLORS.area } : undefined,
     }],
   };
 }
@@ -366,7 +374,7 @@ function AskAnalytics({ workspaceId, user }: { workspaceId?: string; user: User 
     const item=conversations.data?.find(item=>item.id===id);
     if(item) setDatasetId(item.dataset_id);
   };
-  return <Page title="Ask Analytics" subtitle="Ask governed questions about your uploaded data">
+  return <Page title="Ask a Verified Question" subtitle="Every answer is constrained by your approved dataset and read-only calculations">
     <div className="ask-layout"><aside className="panel ask-context"><div className="panel-head"><h2>Context</h2><button className="secondary" onClick={startConversation}>New chat</button></div><label>Dataset<select value={effective||""} onChange={e=>{setDatasetId(e.target.value);setConversationId("");execute.reset();}}>{datasets.data?.map(d=><option key={d.id} value={d.id}>{d.name}</option>)}</select></label>
       {canSelectModel&&<label>Report model<select value={selectedModelId} onChange={e=>setModelId(e.target.value)} disabled={!availableModels.length}><option value="">{availableModels.length?"Select a model":"No configured model"}</option>{availableModels.map(model=><option key={model.id} value={model.id}>{model.display_name} · {model.provider}</option>)}</select>{models.isError&&<small className="error">{models.error.message}</small>}</label>}
       <div className="suggestions"><span>Try asking</span><button onClick={()=>setQuestion("Show monthly net sales trend")}>Monthly sales trend</button><button onClick={()=>setQuestion("Compare net sales by region")}>Sales by region</button><button onClick={()=>setQuestion("Which products have the highest profit?")}>Top products by profit</button></div>
@@ -374,8 +382,8 @@ function AskAnalytics({ workspaceId, user }: { workspaceId?: string; user: User 
     </aside>
     <div className="ask-main"><div className="chat-history">
       {messages.map((message:any)=><article className={`chat-message ${message.role}`} key={message.id}>
-        <strong>{message.role==="user"?"You":"Analytics Copilot"}</strong><p>{message.content}</p>
-        {message.metadata?.sql&&<div className="sql"><code>{message.metadata.sql}</code></div>}
+        <strong>{message.role==="user"?"You":<><span className="verified-label">VERIFIED RESULT</span> Analytics Copilot</>}</strong><p>{message.content}</p>
+        {message.metadata?.sql&&<details className="sql evidence-sql"><summary>Show validated SQL and execution evidence</summary><code>{message.metadata.sql}</code></details>}
         {message.metadata?.chart&&<div className="analysis-chart"><ReactECharts option={analysisChartOption(message.metadata.chart)} style={{height:320}}/></div>}
         {!!message.metadata?.outliers?.length&&<div className="outlier-callouts"><h3>Statistical outliers</h3><div className="outlier-grid">{message.metadata.outliers.map((item:any)=><div className="outlier-card" key={item.column}><strong>{item.column}</strong><span>{item.count} value(s) outside the 1.5×IQR range</span><small>Bounds {item.lower_bound.toPrecision(4)} to {item.upper_bound.toPrecision(4)} · examples {item.examples.join(", ")}</small></div>)}</div></div>}
         {message.metadata?.columns?.length>0&&<table><thead><tr>{message.metadata.columns.map((column:string)=><th key={column}>{column}</th>)}</tr></thead><tbody>{message.metadata.rows.slice(0,20).map((row:any,index:number)=><tr key={index}>{message.metadata.columns.map((column:string)=><td key={column}>{String(row[column]??"")}</td>)}</tr>)}</tbody></table>}
