@@ -1,0 +1,15 @@
+node_modules/
+dist/
+build/
+__pycache__/
+*.pyc
+.env
+*.db
+*.sqlite
+uploads/
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+htmlcov/
+.coverage
