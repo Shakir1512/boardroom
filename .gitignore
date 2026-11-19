@@ -7,9 +7,14 @@ __pycache__/
 *.db
 *.sqlite
 uploads/
+data/
 .venv/
 venv/
 *.egg-info/
 .pytest_cache/
 htmlcov/
 .coverage
+# DuckDB database files
+*.duckdb
+*.duckdb.wal
+*.db
